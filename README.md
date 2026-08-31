@@ -1,90 +1,62 @@
 # mau-flow
 
-`mau-flow` 是一个把 Minimal Agent Unit（MAU）落成 Python 工程的轻量框架。它坚持三个边界：
+把一个任务拆成一条由多个小型 Agent 组成的执行链，并让这条链可以先查看、再运行。
 
-- 控制流代码化：工作流、分支和循环由确定性 Python 代码控制。
-- 认知流局部化：每个 MAU 只拥有自己的短期上下文。
-- 数据交换契约化：单元之间只传递经过 Pydantic 校验的 Handoff 和 Artifact 引用。
-
-## 快速开始
+例如，你想完成一个还没写完的 Python 文件：
 
 ```powershell
-cd mau-flow
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
-pytest
-python examples/quickstart.py
+mau-flow app.py --task "完成接口实现并补齐测试"
 ```
 
-使用真实模型时安装兼容适配器：
+`mau-flow` 会先阅读任务和目标文件，再根据实际复杂度生成一条链：
 
-```powershell
-pip install -e ".[openai]"
+```text
+inspect -> implement -> test -> security_review -> verify
 ```
 
-## CLI
-
-生成动态 MAU 链，但不立即执行：
-
-```powershell
-mau-flow path\to\target.py --task "完成 TODO 并补齐测试"
-```
-
-不指定文件时，以当前目录为任务工作区：
-
-```powershell
-mau-flow --task "检查并修复这个项目"
-```
-
-生成器会根据任务复杂度决定链长；简单任务可能只需要少量 MAU，复杂任务可以拆成更多专业节点。任务、目标文件、每个 MAU 的职责和 MAU-ISA opcode 权限会保存到工作区的 `.mau-flow-chain.xml`。确认或编辑链文件后运行：
+简单任务可能只需要两个或三个节点，复杂任务可以有五个或更多。生成阶段不会修改代码；链会保存为 `.mau-flow-chain.xml`，你可以先检查或编辑它，再决定是否执行：
 
 ```powershell
 mau-flow start
-# 或指定链文件和每个 MAU 的外部轮数上限
-mau-flow start --chain path\to\.mau-flow-chain.xml --max-rounds 12
 ```
 
-## 核心概念
+## MAU 是什么？
 
-```text
-Pipeline (deterministic routing)
-  -> MAU (local planner loop)
-       -> SharedExecutor (controlled side effects)
-       -> Validators (deterministic quality gates)
-  -> typed BaseHandoff (bounded context)
-       -> ArtifactRef (large payload stays outside prompts)
+MAU 是 **Minimal Agent Unit**，即“最小 Agent 单元”。
+
+一个 MAU 不负责包办整个任务，只负责一个边界清楚的环节。例如：
+
+- `inspect` 只检查现状并整理问题；
+- `implement` 只完成修改；
+- `test` 只补充和运行测试；
+- `verify` 独立复核结果。
+
+每个 MAU 都有独立的短期上下文、允许执行的指令和最大运行轮数。完成后，它只把经过 Pydantic 校验的 Handoff 交给下一个 MAU，而不是把整段对话无限传递下去。
+
+这种拆分让模型的职责更聚焦，也让流程、权限和失败位置更容易检查。
+
+## 安装
+
+要求 Python 3.10 或更高版本。
+
+```powershell
+git clone https://github.com/wangzhongren/MAU.git
+cd MAU
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -e ".[dev,openai]"
+pytest
 ```
 
-Planner 通过 `PlannerProtocol` 注入，因此框架不绑定任何模型厂商。示例使用完全离线的脚本化 Planner；接入 OpenAI、私有模型或测试替身时，只需实现 `plan(messages) -> PlannerDecision`。
+不接入模型也可以运行离线示例：
 
-模型与执行器之间使用 **MAU-ISA（MAU Instruction Set Architecture）**。模型输出五种 opcode 指令，不使用 `tool_call` 或模型厂商的函数调用格式：
-
-```xml
-<create>
-  <path>hello.py</path>
-  <content>print('hello')</content>
-</create>
+```powershell
+python examples/quickstart.py
 ```
 
-也可以通过 `PlannerDecision.execute("create", path="hello.py", content="...")` 安全构造。MAU-ISA 内置 opcode 固定为 `create`、`read`、`update`、`delete`、`shell` 五个。
+## 配置模型
 
-```text
-MAU Core -> decode instruction -> Execution Unit -> execute opcode -> result
-```
-
-模型完成当前职责时输出经过校验的 Handoff；若模型在最后一轮仍继续执行 opcode，运行时会确定性生成 `PARTIAL` Handoff，把控制权交给链中的下一个 MAU。
-
-Agent 最大轮数不保存在 MAU 内部，而由工作流调用方逐次传入：
-
-```python
-pipeline.execute(handoff, start="coder", max_rounds_per_agent=10)
-# 或 mau.run(handoff, max_rounds=10)
-```
-
-## 配置文件
-
-可以直接在项目根目录创建不会被 Git 跟踪的 `.env`：
+项目支持 OpenAI Chat Completions 兼容接口。在根目录创建 `.env`：
 
 ```dotenv
 OPENAI_API_KEY=your-key
@@ -93,41 +65,160 @@ MODEL_NAME=your-model
 MAX_OUTPUT_TOKENS=32768
 ```
 
-也可以让项目 `.env` 只保存 `MAU_FLOW_ENV_FILE`，指向仓库外部的密钥文件。
+也可以让项目 `.env` 只保存一个外部配置文件指针：
 
-代码中可安全加载并读取配置：
+```dotenv
+MAU_FLOW_ENV_FILE=C:\path\outside\the\repository\.env
+```
+
+`.env` 和 `.env.*` 默认被 Git 忽略，只有 `.env.example` 会进入版本控制。
+
+## 使用 CLI
+
+### 为一个文件生成执行链
+
+文件可以已经存在，也可以是准备创建的新文件：
+
+```powershell
+mau-flow src\report.py --task "实现 CSV 汇总并添加异常输入测试"
+```
+
+默认会在目标文件所在目录生成 `.mau-flow-chain.xml`。
+
+### 为当前目录生成执行链
+
+```powershell
+mau-flow --task "检查这个项目并修复测试失败"
+```
+
+### 控制链的规模
+
+模型会动态决定实际需要多少个 MAU，`--max-agents` 只设置外部上限：
+
+```powershell
+mau-flow app.py --task "完成并审查这个模块" --max-agents 5
+```
+
+### 运行已经生成的链
+
+```powershell
+mau-flow start
+```
+
+也可以指定链文件，并限制每个 MAU 最多运行多少轮：
+
+```powershell
+mau-flow start --chain path\to\.mau-flow-chain.xml --max-rounds 12
+```
+
+生成和执行是两个独立阶段，因此链文件可以被审阅、修改、保存或纳入其他工作流。
+
+## MAU-ISA
+
+MAU 与执行器之间使用 **MAU-ISA（MAU Instruction Set Architecture）**。
+
+它借用了处理器指令集的概念：MAU 像一个执行特定职责的 Core，执行器负责解码并运行 opcode。目前只有五条基础指令：
+
+```text
+create  read  update  delete  shell
+```
+
+模型直接输出对应指令，不使用厂商专用的 `tool_call` 格式：
+
+```xml
+<read>
+  <path>src/app.py</path>
+</read>
+```
+
+```xml
+<update>
+  <path>src/app.py</path>
+  <content><![CDATA[
+print("updated")
+]]></content>
+</update>
+```
+
+完成当前职责时，MAU 输出 Handoff：
+
+```xml
+<handoff status="SUCCESS">
+  <summary>实现完成，测试已通过</summary>
+</handoff>
+```
+
+```text
+MAU Core -> decode instruction -> Execution Unit -> execute opcode -> result
+```
+
+每个 MAU 只能使用链文件授予的 opcode。如果最后一轮仍未主动提交 Handoff，运行时会生成 `PARTIAL` Handoff，将控制权交给下一个节点，而不会让整条链无限运行。
+
+## Python API
+
+Planner 通过 `PlannerProtocol` 注入，因此框架不绑定某个模型厂商。实现 `plan(messages) -> PlannerDecision` 即可接入其他模型或测试替身。
+
+最大轮数由调用方在每次运行时传入，不保存在 MAU 内部：
+
+```python
+result = mau.run(handoff, max_rounds=10)
+
+result = pipeline.execute(
+    handoff,
+    start="inspect",
+    max_rounds_per_agent=10,
+)
+```
+
+模型配置也可以从 Python 中读取：
 
 ```python
 from mau_flow import OpenAISettings
 
 settings = OpenAISettings.from_environment()
-# settings.api_key / settings.base_url / settings.model / settings.max_output_tokens
 ```
 
-模型输出上限默认为 32K tokens，可在 `.env` 中通过 `MAX_OUTPUT_TOKENS=32768` 覆盖。该预算会同时用于动态链生成和每一轮 MAU 模型调用；对于带内部思考的兼容模型，服务端通常也会从该完成预算中计算思考内容。
-
-`.env` 和 `.env.*` 默认被 Git 忽略，仅 `.env.example` 会进入版本控制。不要把真实 API Key 写入 README、源码或 `.env.example`。
-
-## 当前能力
-
-- Pydantic Handoff、状态和 Artifact 强类型契约
-- 本地 Artifact Store，SHA-256 完整性校验
-- 路径逃逸防护的共享无状态执行器
-- `PLAN -> EXECUTE -> VALIDATE -> HANDOFF` 状态机
-- 调用方传入的最大轮数限制、opcode 白名单、验证失败反馈
-- 根据文件与任务复杂度动态生成、持久化和执行 MAU 链
-- OpenAI 兼容模型适配器及 32K 默认输出预算
-- 支持条件边的确定性工作流及环路步数保护
-- 无需网络/模型即可运行的示例与单元测试
-
-## 项目布局
+## 运行流程
 
 ```text
-src/mau_flow/       框架实现
-tests/              单元与集成测试
-examples/           离线快速开始
+task/file
+   |
+   v
+DynamicChainGenerator
+   |
+   v
+.mau-flow-chain.xml
+   |
+   v
+MAU -> typed Handoff -> MAU -> ... -> final Handoff
+   |                         |
+   +---- MAU-ISA ------------+
+             |
+             v
+       SharedExecutor
 ```
 
-## 安全说明
+框架负责以下确定性边界：
 
-`create/read/update/delete` 会阻止路径逃逸。`shell` 以 `sandbox_dir` 作为工作目录并带有超时，但它仍是任意命令执行能力；工作目录不是安全沙箱。生产环境必须额外使用容器或操作系统隔离、权限审批、资源配额和审计。
+- Pydantic Handoff、状态和 Artifact 契约；
+- 动态链的保存、加载和顺序执行；
+- 每个 MAU 的 opcode 白名单；
+- 调用方提供的轮数上限；
+- 验证失败反馈和 `PARTIAL` 兜底；
+- Pipeline 环路保护；
+- Artifact SHA-256 完整性校验；
+- 文件指令的路径逃逸防护。
+
+## 项目结构
+
+```text
+src/mau_flow/       框架、CLI、MAU-ISA 和模型适配器
+tests/              单元与集成测试
+examples/           离线及真实模型示例
+```
+
+## 安全边界
+
+`create`、`read`、`update` 和 `delete` 会阻止文件路径逃出工作区。
+
+`shell` 以工作区作为当前目录并带有超时，但当前目录并不是操作系统级沙箱。面向不可信任务或生产环境时，仍应增加容器隔离、权限审批、命令策略、资源配额和审计。
