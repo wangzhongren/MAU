@@ -13,6 +13,7 @@ from .planner import PlannerProtocol
 
 HandoffT = TypeVar("HandoffT", bound=BaseHandoff)
 Validator = Callable[[BaseHandoff], None | bool | tuple[bool, str]]
+RoundObserver = Callable[[str, int, str, str], None]
 
 
 class MAUError(RuntimeError):
@@ -38,10 +39,10 @@ class MAU(Generic[HandoffT]):
         planner: PlannerProtocol,
         validators: list[Validator] | None = None,
         allowed_tools: set[str] | None = None,
-        max_steps: int = 20,
         max_validation_retries: int = 3,
+        on_round: RoundObserver | None = None,
     ):
-        if max_steps < 1 or max_validation_retries < 0:
+        if max_validation_retries < 0:
             raise ValueError("Invalid state-machine limits")
         self.name = name
         self.system_prompt = system_prompt
@@ -52,28 +53,82 @@ class MAU(Generic[HandoffT]):
         self.allowed_tools = frozenset(
             executor.tool_names if allowed_tools is None else allowed_tools
         )
-        self.max_steps = max_steps
         self.max_validation_retries = max_validation_retries
+        self.on_round = on_round
 
-    def run(self, input_handoff: BaseHandoff) -> HandoffT:
+    def run(self, input_handoff: BaseHandoff, *, max_rounds: int) -> HandoffT:
+        if max_rounds < 1:
+            raise ValueError("max_rounds must be at least 1")
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self.system_prompt},
+            {
+                "role": "system",
+                "content": (
+                    f"Runtime budget: at most {max_rounds} planner rounds. Reserve the final "
+                    "round for a handoff and do not issue an opcode on the final round."
+                ),
+            },
             {"role": "user", "content": input_handoff.model_dump(mode="json")},
         ]
         validation_failures = 0
 
-        for _step in range(self.max_steps):
+        for _round in range(max_rounds):
             decision = self.planner.plan(messages)
             if decision.action == "execute":
-                if decision.tool_name not in self.allowed_tools:
-                    result = {"status": "error", "error": "tool is not allowed"}
+                try:
+                    tool_name, tool_args = decision.parse_operation()
+                except ValueError as exc:
+                    tool_name, tool_args = "invalid", {}
+                    result = {"status": "error", "error": str(exc)}
+                else:
+                    result = {}
+                if tool_name == "invalid":
+                    pass
+                elif tool_name not in self.allowed_tools:
+                    result = {"status": "error", "error": "opcode is not allowed"}
                 else:
                     try:
-                        result = self.executor.execute(decision.tool_name, **decision.tool_args)
+                        result = self.executor.execute(tool_name, **tool_args)
                     except ToolError as exc:
                         result = {"status": "error", "error": str(exc)}
-                messages.append({"role": "assistant", "content": decision.model_dump(mode="json")})
-                messages.append({"role": "tool", "name": decision.tool_name, "content": result})
+                messages.append({"role": "assistant", "content": decision.operation})
+                messages.append({"role": "tool", "name": tool_name, "content": result})
+                remaining = max_rounds - (_round + 1)
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f"Runtime budget remaining: {remaining} round(s). "
+                            + (
+                                "The next response MUST be a handoff; do not issue another opcode."
+                                if remaining == 1
+                                else "Finish your bounded responsibility and hand off promptly."
+                            )
+                        ),
+                    }
+                )
+                if self.on_round:
+                    action = f"action:{tool_name}"
+                    if tool_name == "protocol_error":
+                        reason = str(tool_args.get("error", "unknown protocol error"))
+                        action = f"protocol-error:{reason[:160]}"
+                    self.on_round(self.name, _round + 1, action, str(result.get("status")))
+                if remaining == 0:
+                    fallback = self.handoff_schema.model_validate(
+                        {
+                            "summary": (
+                                f"{self.name} reached its externally supplied round limit after "
+                                f"calling {tool_name}."
+                            ),
+                            "status": "PARTIAL",
+                            "open_issues": [
+                                "The MAU did not emit a final handoff before its round budget expired."
+                            ],
+                        }
+                    )
+                    if self.on_round:
+                        self.on_round(self.name, _round + 1, "forced-handoff", "PARTIAL")
+                    return fallback
                 continue
 
             try:
@@ -88,9 +143,11 @@ class MAU(Generic[HandoffT]):
                 )
                 messages.append({"role": "system", "content": f"Validation failed: {exc}"})
                 continue
+            if self.on_round:
+                self.on_round(self.name, _round + 1, "handoff", output.status.value)
             return output
 
-        raise MaxStepsExceeded(f"{self.name} exceeded {self.max_steps} planner steps")
+        raise MaxStepsExceeded(f"{self.name} exceeded {max_rounds} planner rounds")
 
     def _validate(self, handoff: BaseHandoff) -> None:
         for validator in self.validators:

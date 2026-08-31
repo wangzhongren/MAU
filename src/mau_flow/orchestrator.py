@@ -46,7 +46,11 @@ class Pipeline:
         self.edges.setdefault(source, []).append(Edge(target, when or (lambda _h: True)))
         return self
 
-    def execute(self, initial_handoff: BaseHandoff, *, start: str) -> BaseHandoff:
+    def execute(
+        self, initial_handoff: BaseHandoff, *, start: str, max_rounds_per_agent: int
+    ) -> BaseHandoff:
+        if max_rounds_per_agent < 1:
+            raise ValueError("max_rounds_per_agent must be at least 1")
         self._check_graph(start)
         current: str | None = start
         handoff = initial_handoff
@@ -55,7 +59,7 @@ class Pipeline:
             visits += 1
             if visits > self.max_node_visits:
                 raise PipelineError("Pipeline exceeded max_node_visits (possible cycle)")
-            handoff = self.nodes[current].run(handoff)
+            handoff = self.nodes[current].run(handoff, max_rounds=max_rounds_per_agent)
             matches = [edge.target for edge in self.edges.get(current, []) if edge.when(handoff)]
             if len(matches) > 1:
                 raise PipelineError(f"Ambiguous route from {current}: {matches}")

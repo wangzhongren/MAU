@@ -5,6 +5,7 @@ from .config import OpenAISettings, load_environment
 from .contracts import ArtifactRef, BaseHandoff, Status
 from .executor import SharedExecutor, ToolError
 from .mau import MAU, MAUError, MaxStepsExceeded, ValidationError
+from .openai_planner import OpenAIPlanner
 from .orchestrator import Pipeline, PipelineError
 from .planner import PlannerDecision, PlannerProtocol
 
@@ -15,6 +16,7 @@ __all__ = [
     "LocalArtifactStore",
     "MAUError",
     "MaxStepsExceeded",
+    "OpenAIPlanner",
     "OpenAISettings",
     "Pipeline",
     "PipelineError",

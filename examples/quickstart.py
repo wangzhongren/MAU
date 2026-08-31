@@ -20,11 +20,7 @@ workspace = Path(__file__).parents[1] / "workspace"
 executor = SharedExecutor(workspace)
 planner = ScriptedPlanner(
     [
-        PlannerDecision(
-            action="execute",
-            tool_name="write_file",
-            tool_args={"path": "hello.py", "content": "print('hello from MAU')\n"},
-        ),
+        PlannerDecision.execute("create", path="hello.py", content="print('hello from MAU')\n"),
         PlannerDecision(
             action="done",
             final_handoff={
@@ -42,13 +38,13 @@ coder = MAU(
     handoff_schema=BaseHandoff,
     executor=executor,
     planner=planner,
-    allowed_tools={"write_file"},
+    allowed_tools={"create"},
 )
 
 pipeline = Pipeline().add_mau(coder)
 result = pipeline.execute(
     BaseHandoff(summary="Create a hello program", status=Status.SUCCESS),
     start="coder",
+    max_rounds_per_agent=5,
 )
 print(result.model_dump_json(indent=2))
-
