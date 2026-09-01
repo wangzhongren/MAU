@@ -6,15 +6,18 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
+from typing import Literal
 from xml.etree import ElementTree
 
-from .contracts import BaseHandoff
-from .executor import SharedExecutor
+from .contracts import BaseHandoff, Status
+from .executor import SharedExecutor, ShellApprover
 from .mau import MAU
 from .openai_planner import OpenAIPlanner
 from .orchestrator import Pipeline
+from .sandbox import TransactionalExecutor
 
 BUILTIN_TOOLS = frozenset({"create", "read", "update", "delete", "shell"})
+SandboxMode = Literal["host", "snapshot"]
 
 
 @dataclass(frozen=True)
@@ -164,18 +167,35 @@ def materialize_chain(
     task: str,
     specs: list[MAUSpec],
     on_round: Callable[[str, int, str, str], None] | None = None,
+    shell_approver: ShellApprover | None = None,
+    sandbox_mode: SandboxMode = "snapshot",
 ) -> Pipeline:
-    executor = SharedExecutor(workspace)
+    if sandbox_mode not in {"host", "snapshot"}:
+        raise ValueError(f"Unknown sandbox mode: {sandbox_mode}")
+    shared_executor = (
+        SharedExecutor(workspace, shell_approver=shell_approver)
+        if sandbox_mode == "host"
+        else None
+    )
     pipeline = Pipeline(max_node_visits=len(specs))
     target_text = target or "the workspace task"
     for spec in specs:
+        executor = shared_executor or TransactionalExecutor(
+            workspace,
+            allowed_tools=spec.tools,
+            shell_approver=shell_approver,
+        )
         pipeline.add_mau(
             MAU(
                 name=spec.name,
                 system_prompt=(
                     f"User task: {task}\nTarget: {target_text}\nYour responsibility: {spec.purpose}\n"
-                    "Use the previous MAU handoff as context. Work only inside the workspace, "
-                    "perform your responsibility, verify your own claims, and return a concise handoff."
+                    "Use the previous MAU handoff as context. You do not inherit another MAU's tool "
+                    "transcript: your typed handoff is the only information passed to the next MAU. "
+                    "Work only inside the workspace, perform your bounded responsibility, and stop "
+                    "investigating with enough rounds left to hand off concrete file paths, findings, "
+                    "decisions, verification evidence, and unresolved issues. Do not repeat upstream "
+                    "investigation already supported by the incoming handoff; act on it promptly."
                 ),
                 handoff_schema=BaseHandoff,
                 executor=executor,
@@ -185,5 +205,9 @@ def materialize_chain(
             )
         )
     for source, target_name in pairwise(specs):
-        pipeline.add_edge(source.name, target_name.name)
+        pipeline.add_edge(
+            source.name,
+            target_name.name,
+            when=lambda handoff: handoff.status == Status.SUCCESS,
+        )
     return pipeline

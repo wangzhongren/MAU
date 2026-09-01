@@ -188,3 +188,32 @@ def test_round_limit_is_supplied_by_caller(tmp_path):
     )
     with pytest.raises(ValueError, match="max_rounds"):
         mau.run(BaseHandoff(summary="input", status=Status.SUCCESS), max_rounds=0)
+
+
+def test_mau_reserves_handoff_rounds_and_rejects_late_opcode(tmp_path):
+    planner = RecordingPlanner(
+        PlannerDecision.execute("create", path="first.txt", content="one"),
+        PlannerDecision.execute("create", path="second.txt", content="two"),
+        PlannerDecision.execute("create", path="late.txt", content="must not run"),
+        done("concrete handoff"),
+    )
+    mau = MAU(
+        name="bounded",
+        system_prompt="",
+        handoff_schema=BaseHandoff,
+        executor=SharedExecutor(tmp_path),
+        planner=planner,
+    )
+
+    result = mau.run(BaseHandoff(summary="input", status=Status.SUCCESS), max_rounds=5)
+
+    assert result.summary == "concrete handoff"
+    assert (tmp_path / "first.txt").is_file()
+    assert (tmp_path / "second.txt").is_file()
+    assert not (tmp_path / "late.txt").exists()
+    assert any(
+        "HANDOFF-ONLY PHASE" in message["content"]
+        for message in planner.calls[2]
+        if message["role"] == "system"
+    )
+    assert "Opcode rejected" in planner.calls[3][-2]["content"]

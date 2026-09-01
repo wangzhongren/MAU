@@ -111,6 +111,29 @@ mau-flow start
 mau-flow start --chain path\to\.mau-flow-chain.xml --max-rounds 12
 ```
 
+执行时默认给每个 MAU 创建独立的事务快照：
+
+```powershell
+mau-flow start --sandbox snapshot
+```
+
+MAU 的文件和 Shell 操作只影响自己的临时副本。只有 Handoff 为 `SUCCESS`，且最终
+Diff 符合该 MAU 的 `create`、`update`、`delete` 权限时，变更才会合并回主工作区。
+`PARTIAL`、`FAILED`、越权删除、敏感文件修改和并发冲突都会丢弃整个临时副本。
+
+如需兼容旧行为，可以显式关闭快照隔离：
+
+```powershell
+mau-flow start --sandbox host
+```
+
+`shell` 指令默认逐条请求批准。非交互环境会拒绝未预授权的命令；如果要完全禁用
+交互式批准，可以使用：
+
+```powershell
+mau-flow start --approval-mode never
+```
+
 生成和执行是两个独立阶段，因此链文件可以被审阅、修改、保存或纳入其他工作流。
 
 ## MAU-ISA
@@ -139,6 +162,22 @@ print("updated")
 ]]></content>
 </update>
 ```
+
+`shell` 使用结构化参数，不会把模型输出交给系统 Shell 解释：
+
+```xml
+<shell>
+  <program>python</program>
+  <arg>-m</arg>
+  <arg>pytest</arg>
+  <cwd>.</cwd>
+  <timeout_seconds>60</timeout_seconds>
+  <reason>运行测试套件</reason>
+</shell>
+```
+
+管道、重定向、分号和命令替换不会被解释。CLI 会在执行前显示解析后的可执行文件、
+参数、工作目录、原因和超时，并要求用户明确批准。
 
 完成当前职责时，MAU 输出 Handoff：
 
@@ -178,6 +217,35 @@ from mau_flow import OpenAISettings
 settings = OpenAISettings.from_environment()
 ```
 
+Python 调用方可以提供审批回调，或者使用参数前缀规则预授权命令：
+
+```python
+from mau_flow import CommandRule, SharedExecutor
+
+executor = SharedExecutor(
+    workspace,
+    shell_rules=[CommandRule("python", ("-m", "pytest"))],
+)
+```
+
+没有匹配规则或审批回调时，`SharedExecutor` 默认拒绝所有 `shell` 指令。不要使用
+`CommandRule("python")` 这类过宽规则，因为它也会允许 `python -c` 执行任意代码。
+
+需要每个 MAU 独立修改副本时，可以直接使用事务执行器：
+
+```python
+from mau_flow import TransactionalExecutor
+
+executor = TransactionalExecutor(
+    workspace,
+    allowed_tools={"create", "read", "update", "shell"},
+    shell_approver=approve_shell,
+)
+```
+
+运行结束后，`finalize(Status.SUCCESS)` 会检查并合并 Diff；其他状态只返回 Diff 元数据并
+回滚。Pipeline 会自动完成这个生命周期，无需 Python 调用方手工 finalize。
+
 ## 运行流程
 
 ```text
@@ -208,6 +276,10 @@ MAU -> typed Handoff -> MAU -> ... -> final Handoff
 - Pipeline 环路保护；
 - Artifact SHA-256 完整性校验；
 - 文件指令的路径逃逸防护。
+- `shell=False` 的结构化进程执行和逐条授权；
+- 子进程最小环境变量、输出上限和进程组超时终止。
+- 每个 MAU 独立的 copy-on-write 工作区快照；
+- 按 opcode 能力审核的 Diff Gate、失败回滚和并发修改检测。
 
 ## 项目结构
 
@@ -221,4 +293,11 @@ examples/           离线及真实模型示例
 
 `create`、`read`、`update` 和 `delete` 会阻止文件路径逃出工作区。
 
-`shell` 以工作区作为当前目录并带有超时，但当前目录并不是操作系统级沙箱。面向不可信任务或生产环境时，仍应增加容器隔离、权限审批、命令策略、资源配额和审计。
+`shell` 默认拒绝执行；CLI 采用逐条人工批准，Python API 可以配置审批回调或
+`CommandRule`。命令通过结构化 argv 运行，不会调用系统 Shell，并且工作目录不能逃出
+工作区。子进程只继承最小环境变量，输出有大小限制，超时会终止整个进程组。
+
+事务快照保护主工作区，不等同于操作系统级沙箱。用户批准的程序（包括 `pytest`、
+`npm test` 等）仍在宿主机运行，可能读取工作区外的文件；但其工作区内修改只有通过
+Diff Gate 才会合并。当前模式适合本地、可信仓库和人工审批场景。面向不可信代码或
+无人值守生产环境时，仍应在外层增加操作系统隔离、网络控制和资源配额。

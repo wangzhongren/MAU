@@ -2,10 +2,15 @@
 
 from pathlib import Path
 
-from mau_flow import MAU, BaseHandoff, OpenAIPlanner, SharedExecutor, Status
+from mau_flow import MAU, BaseHandoff, CommandRequest, OpenAIPlanner, SharedExecutor, Status
+
+
+def approve_shell(request: CommandRequest) -> bool:
+    command = " ".join((str(request.executable), *request.args))
+    return input(f"Allow shell command {command!r} for {request.reason!r}? [y/N] ").lower() == "y"
 
 workspace = Path(__file__).parents[1] / "workspace" / "live_agent"
-executor = SharedExecutor(workspace)
+executor = SharedExecutor(workspace, shell_approver=approve_shell)
 agent = MAU(
     name="coding-agent",
     system_prompt=(

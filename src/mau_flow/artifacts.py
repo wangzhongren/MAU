@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from .contracts import ArtifactRef
 
@@ -32,9 +34,10 @@ class LocalArtifactStore:
         return self.put_bytes(name, text.encode("utf-8"), description)
 
     def read(self, ref: ArtifactRef, verify: bool = True) -> bytes:
-        if not ref.uri.startswith("file:///"):
+        parsed = urlparse(ref.uri)
+        if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
             raise ValueError(f"Unsupported artifact URI: {ref.uri}")
-        path = Path(ref.uri.removeprefix("file:///")).resolve()
+        path = Path(url2pathname(parsed.path)).resolve()
         if path != self.root and self.root not in path.parents:
             raise ValueError(f"Artifact path escapes store root: {ref.uri}")
         data = path.read_bytes()

@@ -59,13 +59,18 @@ class MAU(Generic[HandoffT]):
     def run(self, input_handoff: BaseHandoff, *, max_rounds: int) -> HandoffT:
         if max_rounds < 1:
             raise ValueError("max_rounds must be at least 1")
+        handoff_reserve = min(3, max_rounds if max_rounds == 1 else max_rounds - 1)
+        operation_rounds = max_rounds - handoff_reserve
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self.system_prompt},
             {
                 "role": "system",
                 "content": (
-                    f"Runtime budget: at most {max_rounds} planner rounds. Reserve the final "
-                    "round for a handoff and do not issue an opcode on the final round."
+                    f"Runtime budget: at most {max_rounds} planner rounds. You may issue opcodes "
+                    f"only during the first {operation_rounds} round(s). The final "
+                    f"{handoff_reserve} round(s) are reserved exclusively for a typed handoff. "
+                    "Stop investigating early enough to summarize concrete findings, changed paths, "
+                    "verification evidence, and unresolved issues for the next MAU."
                 ),
             },
             {"role": "user", "content": input_handoff.model_dump(mode="json")},
@@ -73,8 +78,41 @@ class MAU(Generic[HandoffT]):
         validation_failures = 0
 
         for _round in range(max_rounds):
-            decision = self.planner.plan(messages)
+            handoff_only = _round >= operation_rounds
+            if handoff_only:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "HANDOFF-ONLY PHASE: return a <handoff> now. No opcode will be executed. "
+                            "Your handoff is the next MAU's only context, so include concrete file "
+                            "paths, findings, decisions, verification evidence, and open issues."
+                        ),
+                    }
+                )
+            handoff_planner = getattr(self.planner, "plan_handoff", None)
+            decision = (
+                handoff_planner(messages)
+                if handoff_only and callable(handoff_planner)
+                else self.planner.plan(messages)
+            )
             if decision.action == "execute":
+                if handoff_only:
+                    messages.append({"role": "assistant", "content": decision.operation})
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "Opcode rejected because the runtime is in the handoff-only phase. "
+                                "Return the required typed handoff without another opcode."
+                            ),
+                        }
+                    )
+                    if self.on_round:
+                        self.on_round(
+                            self.name, _round + 1, "handoff-required", "error"
+                        )
+                    continue
                 try:
                     tool_name, tool_args = decision.parse_operation()
                 except ValueError as exc:
@@ -113,22 +151,6 @@ class MAU(Generic[HandoffT]):
                         reason = str(tool_args.get("error", "unknown protocol error"))
                         action = f"protocol-error:{reason[:160]}"
                     self.on_round(self.name, _round + 1, action, str(result.get("status")))
-                if remaining == 0:
-                    fallback = self.handoff_schema.model_validate(
-                        {
-                            "summary": (
-                                f"{self.name} reached its externally supplied round limit after "
-                                f"calling {tool_name}."
-                            ),
-                            "status": "PARTIAL",
-                            "open_issues": [
-                                "The MAU did not emit a final handoff before its round budget expired."
-                            ],
-                        }
-                    )
-                    if self.on_round:
-                        self.on_round(self.name, _round + 1, "forced-handoff", "PARTIAL")
-                    return fallback
                 continue
 
             try:
@@ -143,11 +165,44 @@ class MAU(Generic[HandoffT]):
                 )
                 messages.append({"role": "system", "content": f"Validation failed: {exc}"})
                 continue
+            output = self._finalize_executor(output)
             if self.on_round:
                 self.on_round(self.name, _round + 1, "handoff", output.status.value)
             return output
 
-        raise MaxStepsExceeded(f"{self.name} exceeded {max_rounds} planner rounds")
+        fallback = self.handoff_schema.model_validate(
+            {
+                "summary": f"{self.name} reached its round limit without a valid typed handoff.",
+                "status": "PARTIAL",
+                "open_issues": [
+                    "The MAU did not emit a valid handoff during its reserved handoff rounds."
+                ],
+            }
+        )
+        fallback = self._finalize_executor(fallback)
+        if self.on_round:
+            self.on_round(self.name, max_rounds, "forced-handoff", "PARTIAL")
+        return fallback
+
+    def _finalize_executor(self, handoff: HandoffT) -> HandoffT:
+        try:
+            result = self.executor.finalize(handoff.status)
+        except ToolError as exc:
+            payload = handoff.model_dump(mode="python")
+            payload["status"] = "PARTIAL"
+            payload["open_issues"] = [
+                *payload.get("open_issues", []),
+                f"Sandbox diff was rejected: {exc}",
+            ]
+            return self.handoff_schema.model_validate(payload)
+        if result is None or not hasattr(result, "as_metadata"):
+            return handoff
+        payload = handoff.model_dump(mode="python")
+        payload["metadata"] = {
+            **payload.get("metadata", {}),
+            "sandbox_diff": result.as_metadata(),
+        }
+        return self.handoff_schema.model_validate(payload)
 
     def _validate(self, handoff: BaseHandoff) -> None:
         for validator in self.validators:

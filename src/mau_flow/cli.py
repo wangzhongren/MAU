@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
 from .chain import DynamicChainGenerator, load_chain, materialize_chain, save_chain
 from .contracts import BaseHandoff, Status
+from .executor import CommandRequest
 
 DEFAULT_CHAIN_FILE = ".mau-flow-chain.xml"
 
@@ -27,7 +29,31 @@ def _start_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mau-flow start", description="Run a saved MAU chain.")
     parser.add_argument("--chain", "-c", default=DEFAULT_CHAIN_FILE, help="Saved chain XML file")
     parser.add_argument("--max-rounds", type=int, default=10, help="Maximum model rounds per MAU")
+    parser.add_argument(
+        "--approval-mode",
+        choices=("prompt", "never"),
+        default="prompt",
+        help="How to handle shell commands that require approval (default: prompt)",
+    )
+    parser.add_argument(
+        "--sandbox",
+        choices=("snapshot", "host"),
+        default="snapshot",
+        help="Per-MAU workspace isolation (default: snapshot)",
+    )
     return parser
+
+
+def _prompt_shell_approval(request: CommandRequest) -> bool:
+    print("\nShell approval required", file=sys.stderr)
+    print(f"  Reason: {request.reason}", file=sys.stderr)
+    print(f"  Command: {shlex.join(request.argv)}", file=sys.stderr)
+    print(f"  Working directory: {request.cwd}", file=sys.stderr)
+    print(f"  Timeout: {request.timeout_seconds:g}s", file=sys.stderr)
+    if not sys.stdin.isatty():
+        print("  Denied: input is not interactive.", file=sys.stderr)
+        return False
+    return input("Allow once? [y/N] ").strip().lower() in {"y", "yes"}
 
 
 def _resolve_scope(file: str | None) -> tuple[Path, str | None]:
@@ -100,6 +126,8 @@ def start(argv: Sequence[str]) -> int:
         task=task,
         specs=specs,
         on_round=show_round,
+        shell_approver=_prompt_shell_approval if args.approval_mode == "prompt" else None,
+        sandbox_mode=args.sandbox,
     )
     result = pipeline.execute(
         BaseHandoff(summary=task, status=Status.SUCCESS),

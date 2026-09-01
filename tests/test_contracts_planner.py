@@ -37,7 +37,7 @@ def test_mau_isa_instruction_roundtrip_and_validation():
 def test_mau_isa_rejects_duplicate_and_nested_operands():
     duplicate = PlannerDecision(
         action="execute",
-        operation="<read><path>a</path><path>b</path></read>",
+        operation="<update><path>a</path><path>b</path></update>",
     )
     with pytest.raises(ValueError, match="duplicate"):
         duplicate.parse_operation()
@@ -45,5 +45,5 @@ def test_mau_isa_rejects_duplicate_and_nested_operands():
         action="execute",
         operation="<read><path><value>a</value></path></read>",
     )
-    with pytest.raises(ValueError, match="text only"):
+    with pytest.raises(ValueError, match="text-only"):
         nested.parse_operation()

@@ -15,20 +15,40 @@ You execute the MAU-ISA instruction set. Every response MUST be exactly ONE of t
 forms below. Output the element only: no prose, no Markdown fence, and no JSON.
 
 1. <create><path>relative/path</path><content><![CDATA[file content]]></content></create>
-2. <read><path>relative/path</path></read>
+2. <read><path>relative/path</path><path>another/path</path></read>
 3. <update><path>relative/path</path><content><![CDATA[new file content]]></content></update>
 4. <delete><path>relative/path</path></delete>
-5. <shell><command><![CDATA[command text]]></command><timeout_seconds>30</timeout_seconds></shell>
+5. <shell><program>python</program><arg>-m</arg><arg>pytest</arg><cwd>.</cwd><timeout_seconds>30</timeout_seconds><reason>Run the test suite</reason></shell>
 6. <handoff status="SUCCESS"><summary>verified result</summary><decision>optional decision</decision><open_issue>optional issue</open_issue></handoff>
 
 Rules:
 - The executable opcodes are exactly create, read, update, delete, and shell.
 - Use the exact child elements shown for the selected opcode and omit all others.
 - A path is relative to the execution workspace.
-- Always wrap content and command values in CDATA.
-- timeout_seconds is optional for shell and must be between 0 and 300.
+- read accepts one or more path elements and returns separately labeled content for every file.
+  Prefer one multi-file read over shelling out to cat; never concatenate files with cat.
+- Always wrap file content values in CDATA.
+- shell is a structured argv operation, not shell source. Never put pipes, redirects,
+  semicolons, command substitutions, or multiple commands in an argument.
+- shell requires program and reason. arg may repeat and is passed literally. cwd is optional,
+  workspace-relative, and defaults to '.'. timeout_seconds is optional and must be 0 through 300.
 - Handoff status is exactly SUCCESS, PARTIAL, or FAILED. decision and open_issue may repeat.
 - Do not claim SUCCESS until execution output has verified the result.
+""".strip()
+
+_HANDOFF_PROTOCOL = """
+You are in handoff-only synthesis mode. Tool use is unavailable. Review the complete execution
+transcript and return exactly one XML handoff with no prose or Markdown:
+<handoff status="SUCCESS"><summary>concrete result</summary><decision>important decision</decision><open_issue>remaining issue</open_issue></handoff>
+
+Rules:
+- status is exactly SUCCESS, PARTIAL, or FAILED.
+- Evaluate status only against the current MAU's bounded responsibility. Work intentionally
+  assigned to downstream MAUs is not an open issue and does not make this handoff PARTIAL.
+- summary is required and must name concrete findings, changed file paths, and verification evidence.
+- decision and open_issue may repeat or be omitted.
+- Do not output create, read, update, delete, shell, JSON, analysis, or another wrapper.
+- Report PARTIAL or FAILED when work or verification is incomplete; never invent success.
 """.strip()
 
 
@@ -49,8 +69,31 @@ class OpenAIPlanner:
         )
 
     def plan(self, messages: list[dict[str, Any]]) -> PlannerDecision:
+        content = self._complete(messages, _PROTOCOL)
+        if not content:
+            return self._protocol_error("model returned empty output")
+        try:
+            return self._parse_response(content)
+        except (ValueError, ElementTree.ParseError) as exc:
+            return self._protocol_error(str(exc))
+
+    def plan_handoff(self, messages: list[dict[str, Any]]) -> PlannerDecision:
+        """Synthesize a handoff without exposing executable opcode choices."""
+
+        content = self._complete(messages, _HANDOFF_PROTOCOL)
+        if not content:
+            return self._protocol_error("model returned empty handoff")
+        try:
+            decision = self._parse_response(content)
+        except (ValueError, ElementTree.ParseError) as exc:
+            return self._protocol_error(str(exc))
+        if decision.action != "done":
+            return self._protocol_error("handoff-only response contained an opcode")
+        return decision
+
+    def _complete(self, messages: list[dict[str, Any]], protocol: str) -> str | None:
         request_messages: list[dict[str, str]] = [
-            {"role": "system", "content": _PROTOCOL}
+            {"role": "system", "content": protocol}
         ]
         for message in messages:
             role = str(message.get("role", "user"))
@@ -72,13 +115,7 @@ class OpenAIPlanner:
             messages=request_messages,  # type: ignore[arg-type]
             max_tokens=self.settings.max_output_tokens,
         )
-        content = response.choices[0].message.content
-        if not content:
-            return self._protocol_error("model returned empty output")
-        try:
-            return self._parse_response(content)
-        except (ValueError, ElementTree.ParseError) as exc:
-            return self._protocol_error(str(exc))
+        return response.choices[0].message.content
 
     @staticmethod
     def _protocol_error(reason: str) -> PlannerDecision:
@@ -147,7 +184,8 @@ class OpenAIPlanner:
             r"\s*<(?P<tag>[A-Za-z_][A-Za-z0-9_]*)>(?P<value>.*?)</(?P=tag)>",
             flags=re.DOTALL,
         )
-        arguments: dict[str, str] = {}
+        arguments: dict[str, Any] = {}
+        read_paths: list[str] = []
         position = 0
         while position < len(body):
             match = argument_pattern.match(body, position)
@@ -156,11 +194,23 @@ class OpenAIPlanner:
                     raise ValueError("invalid XML-like tool arguments")
                 break
             tag = match.group("tag")
-            if tag in arguments:
+            if opcode == "read" and tag != "path":
+                raise ValueError("read operands must be <path> elements")
+            argument_name = "args" if opcode == "shell" and tag == "arg" else tag
+            if argument_name != "args" and argument_name in arguments:
                 raise ValueError(f"duplicate tool argument: {tag}")
             value = match.group("value")
             if value.startswith("<![CDATA[") and value.endswith("]]>"):
                 value = value[9:-3]
-            arguments[tag] = value
+            if opcode == "read":
+                read_paths.append(value)
+            elif argument_name == "args":
+                arguments.setdefault("args", []).append(value)
+            else:
+                arguments[argument_name] = value
             position = match.end()
+        if opcode == "read":
+            if not read_paths:
+                raise ValueError("read requires at least one path")
+            arguments = {"path": read_paths[0]} if len(read_paths) == 1 else {"paths": read_paths}
         return PlannerDecision.execute(opcode, **arguments)
