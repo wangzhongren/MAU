@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 from xml.etree import ElementTree
 
 from .config import OpenAISettings
 from .planner import PlannerDecision
+from .protocols.responses import XmlResponseCodec
 
 _PROTOCOL = """
 You execute the MAU-ISA instruction set. Every response MUST be exactly ONE of the six
@@ -59,7 +59,9 @@ class OpenAIPlanner:
         try:
             from openai import OpenAI
         except ImportError as exc:  # pragma: no cover - depends on optional extra
-            raise RuntimeError('Install the OpenAI adapter with: pip install -e ".[openai]"') from exc
+            raise RuntimeError(
+                'Install the OpenAI adapter with: pip install -e ".[openai]"'
+            ) from exc
 
         self.settings = settings or OpenAISettings.from_environment()
         self.client = OpenAI(
@@ -92,9 +94,7 @@ class OpenAIPlanner:
         return decision
 
     def _complete(self, messages: list[dict[str, Any]], protocol: str) -> str | None:
-        request_messages: list[dict[str, str]] = [
-            {"role": "system", "content": protocol}
-        ]
+        request_messages: list[dict[str, str]] = [{"role": "system", "content": protocol}]
         for message in messages:
             role = str(message.get("role", "user"))
             content = message.get("content", "")
@@ -102,12 +102,19 @@ class OpenAIPlanner:
                 content = json.dumps(content, ensure_ascii=False)
             if role == "tool":
                 name = message.get("name", "unknown")
+                call_id = message.get("call_id", "unknown")
                 request_messages.append(
-                    {"role": "user", "content": f"MAU-ISA result for opcode {name}:\n{content}"}
+                    {
+                        "role": "user",
+                        "content": f"MAU-ISA result for opcode {name} (call {call_id}):\n{content}",
+                    }
                 )
             else:
                 request_messages.append(
-                    {"role": role if role in {"system", "user", "assistant"} else "user", "content": content}
+                    {
+                        "role": role if role in {"system", "user", "assistant"} else "user",
+                        "content": content,
+                    }
                 )
 
         response = self.client.chat.completions.create(
@@ -123,94 +130,6 @@ class OpenAIPlanner:
             "protocol_error", error=f"Invalid XML-like response: {reason}"
         )
 
-    @staticmethod
-    def _parse_response(content: str) -> PlannerDecision:
-        text = OpenAIPlanner._normalize_dsml(content.strip())
-        tags = ("create", "read", "update", "delete", "shell", "handoff")
-        start_candidates = [(text.find(f"<{tag}"), tag) for tag in tags]
-        start_candidates = [(index, tag) for index, tag in start_candidates if index >= 0]
-        if not start_candidates:
-            escaped = text[:200].encode("unicode_escape").decode("ascii")
-            raise ValueError(f"model returned no supported XML element: {escaped}")
-        start, tag = min(start_candidates)
-        text = text[start:]
-        closing = f"</{tag}>"
-        end = text.find(closing)
-        if end < 0:
-            raise ValueError("model returned incomplete XML")
-        xml = text[: end + len(closing)]
-        if tag != "handoff":
-            decision = PlannerDecision(action="execute", operation=xml)
-            try:
-                decision.parse_operation()
-            except ValueError:
-                decision = OpenAIPlanner._normalize_operation(xml, tag)
-            decision.parse_operation()
-            return decision
-        root = ElementTree.fromstring(xml)
-        if set(root.attrib) != {"status"}:
-            raise ValueError("handoff requires exactly one status attribute")
-        summary = root.findtext("summary", "").strip()
-        if not summary:
-            raise ValueError("handoff requires a non-empty summary")
-        return PlannerDecision(
-            action="done",
-            final_handoff={
-                "summary": summary,
-                "status": root.attrib["status"],
-                "decisions": [item.text or "" for item in root.findall("decision")],
-                "open_issues": [item.text or "" for item in root.findall("open_issue")],
-            },
-        )
-
-    @staticmethod
-    def _normalize_dsml(text: str) -> str:
-        """Remove DeepSeek V4 DSML prefixes leaked into XML-like message content."""
-
-        text = text.replace("<｜DSML｜CDATA[", "<![CDATA[")
-        return text.replace("<｜DSML｜", "<").replace("</｜DSML｜", "</")
-
-    @staticmethod
-    def _normalize_operation(xml: str, opcode: str) -> PlannerDecision:
-        """Normalize model-authored MAU-ISA values containing raw XML characters."""
-
-        root_match = re.fullmatch(
-            rf"\s*<{opcode}\s*>(?P<body>.*)</{opcode}>\s*", xml, flags=re.DOTALL
-        )
-        if not root_match:
-            raise ValueError(f"invalid MAU-ISA opcode root: {opcode}")
-        body = root_match.group("body")
-        argument_pattern = re.compile(
-            r"\s*<(?P<tag>[A-Za-z_][A-Za-z0-9_]*)>(?P<value>.*?)</(?P=tag)>",
-            flags=re.DOTALL,
-        )
-        arguments: dict[str, Any] = {}
-        read_paths: list[str] = []
-        position = 0
-        while position < len(body):
-            match = argument_pattern.match(body, position)
-            if not match:
-                if body[position:].strip():
-                    raise ValueError("invalid XML-like tool arguments")
-                break
-            tag = match.group("tag")
-            if opcode == "read" and tag != "path":
-                raise ValueError("read operands must be <path> elements")
-            argument_name = "args" if opcode == "shell" and tag == "arg" else tag
-            if argument_name != "args" and argument_name in arguments:
-                raise ValueError(f"duplicate tool argument: {tag}")
-            value = match.group("value")
-            if value.startswith("<![CDATA[") and value.endswith("]]>"):
-                value = value[9:-3]
-            if opcode == "read":
-                read_paths.append(value)
-            elif argument_name == "args":
-                arguments.setdefault("args", []).append(value)
-            else:
-                arguments[argument_name] = value
-            position = match.end()
-        if opcode == "read":
-            if not read_paths:
-                raise ValueError("read requires at least one path")
-            arguments = {"path": read_paths[0]} if len(read_paths) == 1 else {"paths": read_paths}
-        return PlannerDecision.execute(opcode, **arguments)
+    _parse_response = staticmethod(XmlResponseCodec._parse_response)
+    _normalize_dsml = staticmethod(XmlResponseCodec._normalize_dsml)
+    _normalize_operation = staticmethod(XmlResponseCodec._normalize_operation)

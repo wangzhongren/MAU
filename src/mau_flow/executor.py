@@ -12,8 +12,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from actunit import ActionCall, ActionExecutionError, ActionResult, ActionRuntime, ExecutionContext
 
-class ToolError(RuntimeError):
+from .builtin_tools import builtin_registry
+
+
+class ToolError(ActionExecutionError):
     pass
 
 
@@ -98,28 +102,28 @@ class SharedExecutor:
         self.shell_rules = tuple(shell_rules)
         self.shell_approver = shell_approver
         self.output_limit_bytes = output_limit_bytes
-        self._tools: dict[str, Callable[..., dict[str, Any]]] = {
-            "create": self._create,
-            "read": self._read,
-            "update": self._update,
-            "delete": self._delete,
-            "shell": self._shell,
-        }
+        self.registry = builtin_registry(self)
+        self.runtime = ActionRuntime(self.registry)
 
     @property
     def tool_names(self) -> frozenset[str]:
-        return frozenset(self._tools)
+        return self.registry.names
+
+    def execute_call(
+        self, call: ActionCall, *, allowed_tools: frozenset[str], agent_id: str = ""
+    ) -> ActionResult:
+        return self.runtime.execute(
+            call, ExecutionContext(self.sandbox_dir, allowed_tools, agent_id=agent_id)
+        )
 
     def execute(self, tool_name: str, **kwargs: Any) -> dict[str, Any]:
-        tool = self._tools.get(tool_name)
-        if tool is None:
-            raise ToolError(f"Unknown tool: {tool_name}")
-        try:
-            return tool(**kwargs)
-        except ToolError:
-            raise
-        except Exception as exc:
-            raise ToolError(f"Tool {tool_name!r} failed: {exc}") from exc
+        result = self.execute_call(
+            ActionCall(name=tool_name, arguments=kwargs),
+            allowed_tools=self.tool_names | {tool_name},
+        )
+        if result.error and result.error.code != "PROCESS_FAILED":
+            raise ToolError(result.error.message, code=result.error.code)
+        return result.as_legacy()
 
     def finalize(self, status: Any) -> Any:
         """Finalize a MAU execution session. The host executor has no transaction."""
@@ -236,7 +240,7 @@ class SharedExecutor:
             reason=reason.strip(),
         )
         if not self._is_command_allowed(request):
-            raise ToolError("Shell command was not approved")
+            raise ToolError("Shell command was not approved", code="APPROVAL_DENIED")
         return self._run_command(request)
 
     def _resolve_executable(self, program: str) -> Path:

@@ -20,6 +20,12 @@ inspect -> implement -> test -> security_review -> verify
 mau-flow start
 ```
 
+如果希望用一句任务直接生成并运行整条产线，可以使用：
+
+```powershell
+mau-flow run app.py --task "完成接口实现并补齐测试"
+```
+
 ## MAU 是什么？
 
 MAU 是 **Minimal Agent Unit**，即“最小 Agent 单元”。
@@ -44,7 +50,7 @@ git clone https://github.com/wangzhongren/MAU.git
 cd MAU
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -e ".[dev,openai]"
+pip install -e ../ActUnit -e ".[dev,openai]"
 pytest
 ```
 
@@ -74,6 +80,23 @@ MAU_FLOW_ENV_FILE=C:\path\outside\the\repository\.env
 `.env` 和 `.env.*` 默认被 Git 忽略，只有 `.env.example` 会进入版本控制。
 
 ## 使用 CLI
+
+### 一条命令生成并运行
+
+`run` 会先生成并保存 `.mau-flow-chain.xml`，展示实际 MAU 链，然后立即执行：
+
+```powershell
+mau-flow run --task "检查这个项目、修复测试失败并完成独立验证"
+```
+
+也可以同时控制 Agent 数量、每个 MAU 的轮次和沙箱模式：
+
+```powershell
+mau-flow run app.py --task "完成并审查这个模块" --max-agents 5 --max-rounds 100 --sandbox snapshot
+```
+
+执行阶段返回 `PARTIAL` 或 `FAILED` 时，`run` 返回非零退出码，但已经生成的链文件会被
+保留，可以检查后使用 `mau-flow start` 再次运行。
 
 ### 为一个文件生成执行链
 
@@ -134,7 +157,8 @@ mau-flow start --sandbox host
 mau-flow start --approval-mode never
 ```
 
-生成和执行是两个独立阶段，因此链文件可以被审阅、修改、保存或纳入其他工作流。
+默认的生成和 `start` 仍是两个独立阶段，因此链文件可以在执行前被审阅、修改、保存
+或纳入其他工作流；`run` 是需要立即执行时的便捷入口。
 
 ## MAU-ISA
 
@@ -282,6 +306,56 @@ MAU -> typed Handoff -> MAU -> ... -> final Handoff
 - 按 opcode 能力审核的 Diff Gate、失败回滚和并发修改检测。
 
 ## 项目结构
+
+### ActUnit：结构化动作执行运行时
+
+ActUnit 已移至同级的独立项目目录 `../ActUnit`。MAU 将其作为依赖，
+不再打包 ActUnit 源码。尚未发布到 PyPI，开发时需先准备该目录并按上述命令安装。
+
+`actunit` 提供 `ActionCall`、`ActionResult`、`ActionRegistry` 和 `ActionRuntime`，
+不依赖模型 API、XML 或 Pipeline。工具参数用 Pydantic 模型校验；执行上下文由调用方
+提供，模型不能通过工具参数替换工作目录或权限。
+
+```python
+from pathlib import Path
+from pydantic import BaseModel, ConfigDict
+from actunit import (
+    ExecutionContext, ActionCall, ActionDefinition, ActionRegistry, ActionRuntime,
+)
+
+class EchoArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str
+
+registry = ActionRegistry()
+registry.register(ActionDefinition(
+    name="echo",
+    description="Return the supplied text",
+    input_schema=EchoArgs,
+    handler=lambda args, context: {"text": args["text"]},
+))
+runtime = ActionRuntime(registry)
+result = runtime.execute(
+    ActionCall(name="echo", arguments={"text": "hello"}),
+    ExecutionContext(Path.cwd(), frozenset({"echo"}), agent_id="example"),
+)
+print(result.model_dump_json())
+```
+
+结果包含调用编号、工具名、状态、数据、耗时及结构化错误。权限拒绝使用
+`PERMISSION_DENIED`，参数错误使用 `INVALID_ARGUMENTS`，缺失文件使用
+`FILE_NOT_FOUND`，Shell 审批拒绝使用 `APPROVAL_DENIED`。
+
+现有五种工具由 `mau_flow/builtin_tools.py` 注册，文件及进程操作仍复用 `SharedExecutor`
+后端；旧的 `execute(name, **args)` 接口继续可用。新调用方可以使用
+`executor.execute_call(call, allowed_tools=...)` 获取完整结构化结果。
+
+XML-like 动作编解码由 ActUnit 的 `XmlActionCodec` 提供；MAU 的 `protocols/`
+仅保留兼容入口与 Handoff 解析。模型客户端负责请求及消息适配。Planner 可以直接返回
+`PlannerDecision(action="execute", tool_call=ActionCall(...))`，无需先生成 XML。
+事务快照与 Diff Gate 仍在 `sandbox.py`，由 MAU 完成或回滚，不由工具运行时管理。
+
+这次抽取提供的是模块边界，未新增模型原生工具调用适配器，也未改变宿主进程的隔离能力。
 
 ```text
 src/mau_flow/       框架、CLI、MAU-ISA 和模型适配器

@@ -1,0 +1,1 @@
+"""Model wire-protocol adapters."""

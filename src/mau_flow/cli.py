@@ -1,4 +1,4 @@
-"""Generate a dynamic MAU chain, then run it as a separate operation."""
+"""Generate, inspect, and execute dynamic MAU chains."""
 
 from __future__ import annotations
 
@@ -8,26 +8,27 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from .chain import DynamicChainGenerator, load_chain, materialize_chain, save_chain
+from .chain import DynamicChainGenerator, SandboxMode, load_chain, materialize_chain, save_chain
 from .contracts import BaseHandoff, Status
 from .executor import CommandRequest
 
 DEFAULT_CHAIN_FILE = ".mau-flow-chain.xml"
 
 
-def _generate_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="mau-flow", description="Generate a dynamic MAU chain.")
+def _add_generation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("file", nargs="?", help="Optional target file, existing or new")
     parser.add_argument("--task", "-t", help="Task instructions; prompted if omitted")
     parser.add_argument("--output", "-o", help=f"Chain file (default: {DEFAULT_CHAIN_FILE})")
     parser.add_argument("--max-agents", type=int, default=8, help="Maximum generated MAUs")
-    parser.add_argument("--context-chars", type=int, default=50000, help="Maximum target content sent to the generator")
-    return parser
+    parser.add_argument(
+        "--context-chars",
+        type=int,
+        default=50000,
+        help="Maximum target content sent to the generator",
+    )
 
 
-def _start_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="mau-flow start", description="Run a saved MAU chain.")
-    parser.add_argument("--chain", "-c", default=DEFAULT_CHAIN_FILE, help="Saved chain XML file")
+def _add_execution_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-rounds", type=int, default=10, help="Maximum model rounds per MAU")
     parser.add_argument(
         "--approval-mode",
@@ -41,6 +42,28 @@ def _start_parser() -> argparse.ArgumentParser:
         default="snapshot",
         help="Per-MAU workspace isolation (default: snapshot)",
     )
+
+
+def _generate_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="mau-flow", description="Generate a dynamic MAU chain.")
+    _add_generation_arguments(parser)
+    return parser
+
+
+def _start_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="mau-flow start", description="Run a saved MAU chain.")
+    parser.add_argument("--chain", "-c", default=DEFAULT_CHAIN_FILE, help="Saved chain XML file")
+    _add_execution_arguments(parser)
+    return parser
+
+
+def _run_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mau-flow run",
+        description="Generate a dynamic MAU chain and execute it immediately.",
+    )
+    _add_generation_arguments(parser)
+    _add_execution_arguments(parser)
     return parser
 
 
@@ -73,9 +96,12 @@ def _print_specs(specs) -> None:
         print(f"  {index}. {spec.name}: {spec.purpose} [{', '.join(sorted(spec.tools))}]")
 
 
-def generate(argv: Sequence[str]) -> int:
-    parser = _generate_parser()
-    args = parser.parse_args(argv)
+def _generate_chain(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    *,
+    show_start_hint: bool,
+) -> Path:
     if args.max_agents < 1:
         parser.error("--max-agents must be at least 1")
     if args.context_chars < 0:
@@ -102,23 +128,38 @@ def generate(argv: Sequence[str]) -> int:
     save_chain(output, workspace=workspace, task=task, target=target, specs=specs)
     print(f"Saved chain: {output}")
     _print_specs(specs)
-    print(f"Run with: mau-flow start --chain {output}")
+    if show_start_hint:
+        print(f"Run with: mau-flow start --chain {output}")
+    return output
+
+
+def generate(argv: Sequence[str]) -> int:
+    parser = _generate_parser()
+    args = parser.parse_args(argv)
+    _generate_chain(args, parser, show_start_hint=True)
     return 0
 
 
-def start(argv: Sequence[str]) -> int:
-    parser = _start_parser()
-    args = parser.parse_args(argv)
-    if args.max_rounds < 1:
+def _execute_chain(
+    chain_path: Path,
+    *,
+    max_rounds: int,
+    approval_mode: str,
+    sandbox: SandboxMode,
+    parser: argparse.ArgumentParser,
+    announce_chain: bool,
+) -> int:
+    if max_rounds < 1:
         parser.error("--max-rounds must be at least 1")
-    chain_path = Path(args.chain).expanduser().resolve()
     if not chain_path.is_file():
         parser.error(f"chain file does not exist: {chain_path}")
     workspace, task, target, specs = load_chain(chain_path)
-    print(f"Loaded chain: {chain_path}")
-    _print_specs(specs)
+    if announce_chain:
+        print(f"Loaded chain: {chain_path}")
+        _print_specs(specs)
+
     def show_round(name: str, round_number: int, action: str, status: str) -> None:
-        print(f"[{name} round {round_number}/{args.max_rounds}] {action} status={status}", flush=True)
+        print(f"[{name} round {round_number}/{max_rounds}] {action} status={status}", flush=True)
 
     pipeline = materialize_chain(
         workspace=workspace,
@@ -126,20 +167,51 @@ def start(argv: Sequence[str]) -> int:
         task=task,
         specs=specs,
         on_round=show_round,
-        shell_approver=_prompt_shell_approval if args.approval_mode == "prompt" else None,
-        sandbox_mode=args.sandbox,
+        shell_approver=_prompt_shell_approval if approval_mode == "prompt" else None,
+        sandbox_mode=sandbox,
     )
     result = pipeline.execute(
         BaseHandoff(summary=task, status=Status.SUCCESS),
         start=specs[0].name,
-        max_rounds_per_agent=args.max_rounds,
+        max_rounds_per_agent=max_rounds,
     )
     print(result.model_dump_json(indent=2))
     return 0 if result.status == Status.SUCCESS else 1
+
+
+def start(argv: Sequence[str]) -> int:
+    parser = _start_parser()
+    args = parser.parse_args(argv)
+    chain_path = Path(args.chain).expanduser().resolve()
+    return _execute_chain(
+        chain_path,
+        max_rounds=args.max_rounds,
+        approval_mode=args.approval_mode,
+        sandbox=args.sandbox,
+        parser=parser,
+        announce_chain=True,
+    )
+
+
+def run(argv: Sequence[str]) -> int:
+    parser = _run_parser()
+    args = parser.parse_args(argv)
+    chain_path = _generate_chain(args, parser, show_start_hint=False)
+    print(f"Starting generated chain: {chain_path}")
+    return _execute_chain(
+        chain_path,
+        max_rounds=args.max_rounds,
+        approval_mode=args.approval_mode,
+        sandbox=args.sandbox,
+        parser=parser,
+        announce_chain=False,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] == "start":
         return start(arguments[1:])
+    if arguments and arguments[0] == "run":
+        return run(arguments[1:])
     return generate(arguments)

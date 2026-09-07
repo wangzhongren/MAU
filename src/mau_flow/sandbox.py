@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from actunit import ActionCall, ActionResult
+
 from .contracts import Status
 from .executor import SharedExecutor, ShellApprover, ToolError
 
@@ -138,6 +140,13 @@ class TransactionalExecutor(SharedExecutor):
     def execute(self, tool_name: str, **kwargs: Any) -> dict[str, Any]:
         self._ensure_started()
         return super().execute(tool_name, **kwargs)
+
+    def execute_call(
+        self, call: ActionCall, *, allowed_tools: frozenset[str], agent_id: str = ""
+    ) -> ActionResult:
+        if call.name in allowed_tools:
+            self._ensure_started()
+        return super().execute_call(call, allowed_tools=allowed_tools, agent_id=agent_id)
 
     def finalize(self, status: Any) -> WorkspaceDiff | None:
         if self._temporary_root is None or self._baseline is None:

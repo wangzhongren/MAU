@@ -109,28 +109,37 @@ class MAU(Generic[HandoffT]):
                         }
                     )
                     if self.on_round:
-                        self.on_round(
-                            self.name, _round + 1, "handoff-required", "error"
-                        )
+                        self.on_round(self.name, _round + 1, "handoff-required", "error")
                     continue
                 try:
-                    tool_name, tool_args = decision.parse_operation()
+                    call = decision.to_tool_call()
+                    tool_name, tool_args = call.name, call.arguments
                 except ValueError as exc:
                     tool_name, tool_args = "invalid", {}
                     result = {"status": "error", "error": str(exc)}
                 else:
                     result = {}
+                tool_metadata: dict[str, Any] = {}
                 if tool_name == "invalid":
                     pass
-                elif tool_name not in self.allowed_tools:
-                    result = {"status": "error", "error": "opcode is not allowed"}
                 else:
-                    try:
-                        result = self.executor.execute(tool_name, **tool_args)
-                    except ToolError as exc:
-                        result = {"status": "error", "error": str(exc)}
-                messages.append({"role": "assistant", "content": decision.operation})
-                messages.append({"role": "tool", "name": tool_name, "content": result})
+                    tool_result = self.executor.execute_call(
+                        call, allowed_tools=self.allowed_tools, agent_id=self.name
+                    )
+                    result = tool_result.as_legacy()
+                    tool_metadata = {
+                        "call_id": tool_result.call_id,
+                        "result": tool_result.model_dump(mode="json"),
+                    }
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": decision.operation or decision.model_dump(mode="json"),
+                    }
+                )
+                messages.append(
+                    {"role": "tool", "name": tool_name, "content": result, **tool_metadata}
+                )
                 remaining = max_rounds - (_round + 1)
                 messages.append(
                     {
@@ -159,10 +168,10 @@ class MAU(Generic[HandoffT]):
             except (PydanticValidationError, ValidationError) as exc:
                 validation_failures += 1
                 if validation_failures > self.max_validation_retries:
-                    raise ValidationError(f"{self.name} exhausted validation retries: {exc}") from exc
-                messages.append(
-                    {"role": "assistant", "content": decision.model_dump(mode="json")}
-                )
+                    raise ValidationError(
+                        f"{self.name} exhausted validation retries: {exc}"
+                    ) from exc
+                messages.append({"role": "assistant", "content": decision.model_dump(mode="json")})
                 messages.append({"role": "system", "content": f"Validation failed: {exc}"})
                 continue
             output = self._finalize_executor(output)
